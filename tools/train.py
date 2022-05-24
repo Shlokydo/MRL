@@ -1,4 +1,4 @@
-# Copyright 2022 "MRL: Learning to Mix with Attention and Convolutions " authors
+# Copyright 2022 | "MRL: Learning to Mix with Attention and Convolutions Learning " authors
 # The source code is solely provided for the purpose of the review process in the paper submission.
 from __future__ import absolute_import
 from __future__ import division
