@@ -76,6 +76,126 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+class Regional_Local_ML_Attention(nn.Module):
+    # Does not support the use of class tokens
+    def __init__(self,
+                 dim_in,
+                 dim_out,
+                 num_heads,
+                 basis_bias = True,
+                 attn_drop = 0,
+                 proj_drop = 0,
+                 locality = 4,
+                 basis_drop = 0,
+                 **kwargs
+                 ):
+        super().__init__()
+        self.dim_in = dim_in
+        self.dim_out = dim_out
+        self.num_heads = num_heads
+        self.locality = locality
+
+        # Set the inner dimension
+        self.inner_dim = dim_in // num_heads
+
+        self.scale = dim_out ** -0.5
+
+        # Make shared basis space for QKV
+        self.basis_set_regional = self._build_basis(
+            dim_in, locality, basis_bias, basis_drop, 0, locality
+        )
+
+        #Self-Atten on regional sppace
+        self.regional_atten = Attention(dim_in,
+                                        dim_in,
+                                        num_heads,
+                                        qkv_bias=False,
+                                        attn_drop=0.,
+                                        proj_drop=0.,
+                                        method='dw_bn',
+                                        kernel_size=kwargs['kernel_size'],
+                                        stride_kv=kwargs['stride_kv'],
+                                        stride_q=kwargs['stride_q'],
+                                        padding_kv=kwargs['padding_kv'],
+                                        padding_q=kwargs['padding_q'],
+                                        with_cls_token=False)
+
+        #For mixing features locally
+        self.mix_locally = nn.Conv2d(dim_in, dim_in, kernel_size = 3, padding = 1, stride = 1, groups = dim_in // kwargs['conv_inflate'])
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim_out, dim_out)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def _build_basis(self,
+                     dim_in,
+                     locality,
+                     basis_bias,
+                     basis_drop,
+                     padding = 0,
+                     stride = 1):
+        return nn.Sequential(OrderedDict([
+            ('conv', nn.Conv2d(
+                dim_in,
+                dim_in,
+                kernel_size = locality,
+                padding = padding,
+                stride = stride,
+                bias = False,
+                groups = dim_in # CvT uses only 'one' filter per channel
+            )),
+            ('bn', nn.BatchNorm2d(dim_in)),
+            ('linear_indim', nn.Conv2d(
+                dim_in,
+                dim_in,
+                kernel_size = 1,
+                padding = 0,
+                stride = 1,
+                bias = basis_bias,
+                groups = 1 
+            )),
+            ('basis_drop', nn.Dropout2d(basis_drop)),
+        ]))
+        
+    def forward_basis_coefficient_regional(self, x):
+
+        # Calculate the basis set: (b, c, h, w)
+        basis = self.basis_set_regional(x)
+
+        # Mix tokens
+        atten = self.regional_atten(basis)
+        
+        _, _, h_basis, w_basis = basis.shape
+
+        return atten, h_basis, w_basis
+
+    def forward_basis_coefficient_local(self, x):
+
+        # Mix tokens
+        x = self.mix_locally(x)
+
+        return x
+
+    def forward(self, x, h, w):
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
+
+        regional, h_regional, w_regional = self.forward_basis_coefficient_regional(x)
+
+        #Do a broadcast sum of the resultant regional tokens
+        regional = rearrange(regional, 'b c h w -> (b h w) c 1 1')
+        x_local = rearrange(x, 'b c (h1 h) (w1 w)-> (b h1 w1) c h w', h1 = h_regional, w1 = w_regional)
+        x_local = torch.add(x_local, regional)
+        x_local = rearrange(x_local, '(b h1 w1) c h w -> b c (h1 h) (w1 w)', h1 = h_regional, w1 = w_regional)
+
+        x = self.forward_basis_coefficient_local(x_local)
+
+        x = rearrange(x, 'b c h w -> b (h w) c')
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
 class Attention(nn.Module):
     def __init__(self,
                  dim_in,
@@ -101,28 +221,19 @@ class Attention(nn.Module):
         self.with_cls_token = with_cls_token
 
         self.conv_proj_q = self._build_projection(
-            dim_in, dim_out, kwargs['locality'], 0,
-            kwargs['locality'], 'linear' if method == 'avg' else method, 
+            dim_in, dim_out, kernel_size, padding_q,
+            stride_q, 'linear' if method == 'avg' else method, 
         )
         self.conv_proj_k = self._build_projection(
-            dim_in, dim_out, kwargs['locality'], 0,
-            kwargs['locality'], method,
+            dim_in, dim_out, kernel_size, padding_kv,
+            stride_kv, method,
         )
         self.conv_proj_v = self._build_projection(
-            dim_in, dim_out, kwargs['locality'], 0,
-            kwargs['locality'], method,
+            dim_in, dim_out, kernel_size, padding_kv,
+            stride_kv, method,
         )
 
-        #For mixing features locally
-        self.mix_locally = nn.Conv2d(dim_in, dim_in, kernel_size = 3, padding = 1, stride = 1, groups = dim_in // kwargs['conv_inflate'])
-
-        self.proj_q = nn.Linear(dim_in, dim_out, bias=qkv_bias)
-        self.proj_k = nn.Linear(dim_in, dim_out, bias=qkv_bias)
-        self.proj_v = nn.Linear(dim_in, dim_out, bias=qkv_bias)
-
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim_out, dim_out)
-        self.proj_drop = nn.Dropout(proj_drop)
 
     def _build_projection(self,
                           dim_in,
@@ -143,6 +254,7 @@ class Attention(nn.Module):
                     groups=dim_in
                 )),
                 ('bn', nn.BatchNorm2d(dim_in)),
+                ('rearrage', Rearrange('b c h w -> b (h w) c')),
             ]))
         elif method == 'avg':
             proj = nn.Sequential(OrderedDict([
@@ -161,41 +273,40 @@ class Attention(nn.Module):
 
         return proj
 
-    def forward_conv(self, q, k, v, h, w):
+    def forward_conv(self, x, h, w):
         if self.with_cls_token:
             cls_token, x = torch.split(x, [1, h*w], 1)
 
-        q = rearrange(q, 'b (h w) c -> b c h w', h=h, w=w)
-        k = rearrange(k, 'b (h w) c -> b c h w', h=h, w=w)
-        v = rearrange(v, 'b (h w) c -> b c h w', h=h, w=w)
-
         if self.conv_proj_q is not None:
-            q = self.conv_proj_q(q)
-            _, _, rh, rw = q.shape
-            q = rearrange(q, 'b c h w -> b (h w) c')
+            q = self.conv_proj_q(x)
+        else:
+            q = rearrange(x, 'b c h w -> b (h w) c')
 
         if self.conv_proj_k is not None:
-            k = self.conv_proj_k(k)
-            k = rearrange(k, 'b c h w -> b (h w) c')
+            k = self.conv_proj_k(x)
+        else:
+            k = rearrange(x, 'b c h w -> b (h w) c')
 
         if self.conv_proj_v is not None:
-            v = self.conv_proj_v(v)
-            v = rearrange(v, 'b c h w -> b (h w) c')
+            v = self.conv_proj_v(x)
+        else:
+            v = rearrange(x, 'b c h w -> b (h w) c')
 
         if self.with_cls_token:
             q = torch.cat((cls_token, q), dim=1)
             k = torch.cat((cls_token, k), dim=1)
             v = torch.cat((cls_token, v), dim=1)
 
-        return q, k, v, rh, rw
-    
-    def regional_attention(self, x, h, w):
+        return q, k, v
 
-        # Project QKV
-        q = self.proj_q(x)
-        k = self.proj_k(x)
-        v = self.proj_v(x)
-        q, k, v, rh, rw = self.forward_conv(q, k, v, h, w)
+    def forward(self, x):
+        _, _, h, w = x.shape
+        if (
+            self.conv_proj_q is not None
+            or self.conv_proj_k is not None
+            or self.conv_proj_v is not None
+        ):
+            q, k, v = self.forward_conv(x, h, w)
 
         q = rearrange((q), 'b t (h d) -> b h t d', h=self.num_heads)
         k = rearrange((k), 'b t (h d) -> b h t d', h=self.num_heads)
@@ -205,28 +316,8 @@ class Attention(nn.Module):
         attn = F.softmax(attn_score, dim=-1)
         attn = self.attn_drop(attn)
 
-        regional_x = torch.einsum('bhlt,bhtv->bhlv', [attn, v])
-
-        return regional_x, rh, rw
-
-    def forward(self, x, h, w):
-
-        #Mix regionally
-        regional_x, regional_h, regional_w = self.regional_attention(x, h, w)        
-
-        #Do broadcast sum of regional values to local domains
-        regional_x = rearrange(regional_x, 'b n t d -> (b t) (n d) 1 1')
-        x_local = rearrange(x, 'b (h1 h2 w1 w2) c -> (b h1 w1) c h2 w2', h1 = regional_h, w1 = regional_w, h2 = h // regional_h)
-        x_local = torch.add(x_local, regional_x)
-        x_local = rearrange(x_local, '(b h1 w1) c h w -> b c (h1 h) (w1 w)', h1 = regional_h, w1 = regional_w)
-
-        #Mix locally
-        x = self.mix_locally(x_local)
-
-        x = rearrange(x, 'b c h w -> b (h w) c')
-
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x = torch.einsum('bhlt,bhtv->bhlv', [attn, v])
+        x = rearrange(x, 'b n (h w) d -> b (n d) h w', h = h, w = w)
 
         return x
 
@@ -282,15 +373,6 @@ class Attention(nn.Module):
             )
             flops += params * H_QKV * W_QKV
 
-        params = sum([p.numel() for p in module.proj_q.parameters()])
-        flops += params * T_QKV
-        params = sum([p.numel() for p in module.proj_k.parameters()])
-        flops += params * T_QKV
-        params = sum([p.numel() for p in module.proj_v.parameters()])
-        flops += params * T_QKV
-        params = sum([p.numel() for p in module.proj.parameters()])
-        flops += params * T
-
         module.__flops__ += flops
 
 class Block(nn.Module):
@@ -312,10 +394,16 @@ class Block(nn.Module):
         self.with_cls_token = kwargs['with_cls_token']
 
         self.norm1 = norm_layer(dim_in)
-        self.attn = Attention(
-            dim_in, dim_out, num_heads, qkv_bias, attn_drop, drop,
-            **kwargs
-        )
+        if kwargs['atten_type'] == 'orig':
+            self.attn = Attention(
+                dim_in, dim_out, num_heads, qkv_bias, attn_drop, drop,
+                **kwargs
+            )
+        elif kwargs['atten_type'] == 'rl_ml':
+            self.attn = Regional_Local_ML_Attention(
+                dim_in, dim_out, num_heads, qkv_bias, attn_drop, drop,
+                **kwargs
+            )
 
         self.drop_path = DropPath(drop_path) \
             if drop_path > 0. else nn.Identity()
@@ -528,8 +616,9 @@ class ConvolutionalVisionTransformer(nn.Module):
                 'stride_kv': spec['STRIDE_KV'][i],
                 'stride_q': spec['STRIDE_Q'][i],
                 'atten_type': spec.get('ATTEN_TYPE', ['orig'] * self.num_stages)[i],
+                'locality': spec.get('LOCALITY', [3] * self.num_stages)[i],
                 'conv_inflate': spec.get('CONV_INFLATE', [1] * self.num_stages)[i],
-                'locality': spec.get('LOCALITY', [2] * self.num_stages)[i],
+                'basis_drop': spec.get('BASIS_DROP', [0.] * self.num_stages)[i],
             }
 
             stage = VisionTransformer(
