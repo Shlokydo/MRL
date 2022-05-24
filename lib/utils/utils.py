@@ -59,9 +59,6 @@ def init_distributed(args):
         args.rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
         args.world_size = int(os.environ["OMPI_COMM_WORLD_SIZE"])
         args.local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-        master_addr = os.getenv("MASTER_ADDR", default="localhost")
-        master_port = os.getenv('MASTER_PORT', default='8888')
-        method = "tcp://{}:{}".format(master_addr, master_port)
     else:
         args.distributed = False
         return
@@ -70,7 +67,7 @@ def init_distributed(args):
         print("=> init process group start")
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(
-                backend="nccl", init_method=method, 
+                backend="nccl", init_method=f"file://{args.shared_file}", 
             world_size = args.world_size,
             rank = args.rank,
             timeout=timedelta(minutes=180))
